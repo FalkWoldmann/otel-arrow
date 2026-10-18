@@ -26,10 +26,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use otel_arrow_dfe_telemetry::otel_warn;
 use otel_arrow_dfe_telemetry::registry::EntityKey;
 use otel_arrow_dfe_telemetry::reporter::MetricsReporter;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::task::{self, JoinError, JoinHandle, LocalSet};
+use tokio::task::{JoinError, JoinHandle, LocalSet};
 use tokio::time::Instant as TokioInstant;
 
 /// Cleanup window granted to extensions after the data path has drained.
@@ -51,9 +54,30 @@ pub(crate) enum LifecyclePhase {
     ShuttingDown { deadline: Instant },
 }
 
+/// An extension task's join result, tagged with the extension it belongs to.
+type KeyedJoinResult = (ExtensionKey, Result<Result<(), Error>, JoinError>);
+
+/// Join handle that resolves to its extension's key along with the join
+/// result, so every outcome, including a panic or cancellation (which carry
+/// no task output), is attributed to its extension.
+struct KeyedJoinHandle {
+    key: ExtensionKey,
+    handle: JoinHandle<Result<(), Error>>,
+}
+
+impl Future for KeyedJoinHandle {
+    type Output = KeyedJoinResult;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        Pin::new(&mut this.handle)
+            .poll(cx)
+            .map(|joined| (this.key.clone(), joined))
+    }
+}
+
 pub(crate) struct ExtensionLifecycle {
-    futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>>,
-    task_id_to_key: HashMap<task::Id, ExtensionKey>,
+    futures: FuturesUnordered<KeyedJoinHandle>,
     shutdown_channels: Vec<(ExtensionKey, ExtensionShutdownChannel)>,
     _passive: Vec<ExtensionWrapper>,
     phase: LifecyclePhase,
@@ -77,9 +101,7 @@ impl ExtensionLifecycle {
         ext_ctx: &ExtensionContext,
         mut monitor: ExtensionMetricsMonitor,
     ) -> Self {
-        let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-            FuturesUnordered::new();
-        let mut task_id_to_key: HashMap<task::Id, ExtensionKey> = HashMap::new();
+        let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
         let mut shutdown_channels: Vec<(ExtensionKey, ExtensionShutdownChannel)> = Vec::new();
         let mut passive = Vec::new();
         let mut pending_starts: HashSet<ExtensionKey> = HashSet::new();
@@ -142,11 +164,12 @@ impl ExtensionLifecycle {
                 };
                 drop(telemetry_guard);
                 drop(control_sender);
-                (task_key, res)
+                res
             };
-            let handle = local_tasks.spawn_local(fut);
-            let _ = task_id_to_key.insert(handle.id(), key.clone());
-            futures.push(handle);
+            futures.push(KeyedJoinHandle {
+                key: key.clone(),
+                handle: local_tasks.spawn_local(fut),
+            });
             let _ = pending_starts.insert(key);
         }
         // Drop the seed so `started_rx.recv()` returns None once all clones drop.
@@ -154,7 +177,6 @@ impl ExtensionLifecycle {
 
         Self {
             futures,
-            task_id_to_key,
             shutdown_channels,
             _passive: passive,
             phase: LifecyclePhase::Running,
@@ -178,7 +200,6 @@ impl ExtensionLifecycle {
             let shutdown_initiated = matches!(self.phase, LifecyclePhase::ShuttingDown { .. });
             let Self {
                 futures,
-                task_id_to_key,
                 shutdown_channels,
                 monitor,
                 started_rx,
@@ -201,12 +222,10 @@ impl ExtensionLifecycle {
                     let _ = pending_starts.remove(&key);
                     continue;
                 }
-                Some(joined) = futures.next() => {
-                    if let Some(k) = Self::pending_key_for(&joined, task_id_to_key) {
-                        let _ = pending_starts.remove(&k);
-                    }
+                Some((key, joined)) = futures.next() => {
+                    let _ = pending_starts.remove(&key);
                     return LifecycleEvent::Completion(
-                        Self::route_joined(monitor, task_id_to_key, shutdown_channels, shutdown_initiated, joined)
+                        Self::route_joined(monitor, shutdown_channels, shutdown_initiated, key, joined)
                     );
                 }
                 now = monitor.next_tick() => return LifecycleEvent::MonitorTick(now),
@@ -225,7 +244,6 @@ impl ExtensionLifecycle {
         loop {
             let Self {
                 futures,
-                task_id_to_key,
                 shutdown_channels,
                 monitor,
                 started_rx,
@@ -237,12 +255,9 @@ impl ExtensionLifecycle {
             // satisfied. During the barrier every completion is an error,
             // so a task that signaled and then died must not be masked by
             // pending_starts having already been cleared by the signal.
-            if let Some(Some(joined)) = futures.next().now_or_never() {
-                if let Some(k) = Self::pending_key_for(&joined, task_id_to_key) {
-                    let _ = pending_starts.remove(&k);
-                }
-                match Self::route_joined(monitor, task_id_to_key, shutdown_channels, false, joined)
-                {
+            if let Some(Some((key, joined))) = futures.next().now_or_never() {
+                let _ = pending_starts.remove(&key);
+                match Self::route_joined(monitor, shutdown_channels, false, key, joined) {
                     Ok(Ok(())) => unreachable!(
                         "route_joined(shutdown_initiated=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
                     ),
@@ -265,11 +280,9 @@ impl ExtensionLifecycle {
                 Some(key) = started_rx.recv() => {
                     let _ = pending_starts.remove(&key);
                 }
-                Some(joined) = futures.next(), if !futures.is_empty() => {
-                    if let Some(k) = Self::pending_key_for(&joined, task_id_to_key) {
-                        let _ = pending_starts.remove(&k);
-                    }
-                    match Self::route_joined(monitor, task_id_to_key, shutdown_channels, false, joined) {
+                Some((key, joined)) = futures.next(), if !futures.is_empty() => {
+                    let _ = pending_starts.remove(&key);
+                    match Self::route_joined(monitor, shutdown_channels, false, key, joined) {
                         Ok(Ok(())) => unreachable!(
                             "route_joined(shutdown_initiated=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
                         ),
@@ -316,7 +329,6 @@ impl ExtensionLifecycle {
         while !waiters.is_empty() {
             let Self {
                 futures,
-                task_id_to_key,
                 shutdown_channels,
                 monitor,
                 ..
@@ -327,8 +339,8 @@ impl ExtensionLifecycle {
                 // A task completing before the gate is satisfied means an
                 // extension died during startup; surface it instead of
                 // starting data-path nodes against a lost extension.
-                Some(joined) = futures.next(), if !futures.is_empty() => {
-                    match Self::route_joined(monitor, task_id_to_key, shutdown_channels, false, joined) {
+                Some((key, joined)) = futures.next(), if !futures.is_empty() => {
+                    match Self::route_joined(monitor, shutdown_channels, false, key, joined) {
                         Ok(Ok(())) => unreachable!(
                             "route_joined(shutdown_initiated=false) must upgrade Ok(()) to ExtensionExitedBeforeShutdown",
                         ),
@@ -365,34 +377,19 @@ impl ExtensionLifecycle {
         Ok(())
     }
 
-    /// Returns the `ExtensionKey` associated with a `joined` outcome so the
-    /// caller can prune `pending_starts`. Falls back to `task_id_to_key`
-    /// when the task panicked before signalling (and thus before its body
-    /// could embed the key in the `Ok` payload).
-    fn pending_key_for(
-        joined: &Result<(ExtensionKey, Result<(), Error>), JoinError>,
-        task_id_to_key: &HashMap<task::Id, ExtensionKey>,
-    ) -> Option<ExtensionKey> {
-        match joined {
-            Ok((k, _)) => Some(k.clone()),
-            Err(e) => task_id_to_key.get(&e.id()).cloned(),
-        }
-    }
-
     /// Records the completion in the monitor, prunes the shutdown channel for
     /// this extension, and upgrades an early `Ok(())` to
     /// `ExtensionExitedBeforeShutdown` when shutdown hasn't been initiated.
     fn route_joined(
         monitor: &mut ExtensionMetricsMonitor,
-        task_id_to_key: &mut HashMap<task::Id, ExtensionKey>,
         shutdown_channels: &mut Vec<(ExtensionKey, ExtensionShutdownChannel)>,
         shutdown_initiated: bool,
-        joined: Result<(ExtensionKey, Result<(), Error>), JoinError>,
+        key: ExtensionKey,
+        joined: Result<Result<(), Error>, JoinError>,
     ) -> Result<Result<(), Error>, JoinError> {
+        shutdown_channels.retain(|(k, _)| k != &key);
         match joined {
-            Ok((key, res)) => {
-                task_id_to_key.retain(|_, k| k != &key);
-                shutdown_channels.retain(|(k, _)| k != &key);
+            Ok(res) => {
                 let res = match res {
                     Ok(()) if !shutdown_initiated => Err(Error::ExtensionExitedBeforeShutdown {
                         extension: key.id.to_string(),
@@ -407,23 +404,12 @@ impl ExtensionLifecycle {
                 Ok(res)
             }
             Err(e) => {
-                let task_id = e.id();
-                if let Some(key) = task_id_to_key.remove(&task_id) {
-                    shutdown_channels.retain(|(k, _)| k != &key);
-                    let outcome = if e.is_cancelled() {
-                        ExtensionOutcome::JoinCancelled
-                    } else {
-                        ExtensionOutcome::JoinPanic
-                    };
-                    monitor.apply_event(ExtensionLifecycleEvent::Completed { key, outcome });
+                let outcome = if e.is_cancelled() {
+                    ExtensionOutcome::JoinCancelled
                 } else {
-                    otel_warn!(
-                        "extension.task.join_error.unknown_task",
-                        is_canceled = e.is_cancelled(),
-                        is_panic = e.is_panic(),
-                        task_id = format!("{task_id}"),
-                    );
-                }
+                    ExtensionOutcome::JoinPanic
+                };
+                monitor.apply_event(ExtensionLifecycleEvent::Completed { key, outcome });
                 Err(e)
             }
         }
@@ -498,49 +484,32 @@ impl ExtensionLifecycle {
         let drain_deadline = TokioInstant::from_std(deadline + EXTENSION_SHUTDOWN_DRAIN_SLACK);
 
         let futures = &mut self.futures;
-        let task_id_to_key = &mut self.task_id_to_key;
         let shutdown_channels = &mut self.shutdown_channels;
         let monitor = &mut self.monitor;
         let drain = async {
-            while let Some(result) = futures.next().await {
-                match result {
-                    Ok((key, Ok(()))) => {
-                        task_id_to_key.retain(|_, k| k != &key);
-                        shutdown_channels.retain(|(k, _)| k != &key);
-                        monitor.apply_event(ExtensionLifecycleEvent::Completed {
-                            key,
-                            outcome: ExtensionOutcome::Ok,
-                        });
-                    }
-                    Ok((key, Err(e))) => {
-                        task_id_to_key.retain(|_, k| k != &key);
-                        shutdown_channels.retain(|(k, _)| k != &key);
+            while let Some((key, result)) = futures.next().await {
+                shutdown_channels.retain(|(k, _)| k != &key);
+                let outcome = match result {
+                    Ok(Ok(())) => ExtensionOutcome::Ok,
+                    Ok(Err(e)) => {
                         otel_warn!("extension.shutdown.task.error", error = format!("{e}"));
-                        monitor.apply_event(ExtensionLifecycleEvent::Completed {
-                            key,
-                            outcome: ExtensionOutcome::Err(e.to_string()),
-                        });
+                        ExtensionOutcome::Err(e.to_string())
                     }
                     Err(e) => {
-                        let task_id = e.id();
                         otel_warn!(
                             "extension.shutdown.task.join_error",
                             is_canceled = e.is_cancelled(),
                             is_panic = e.is_panic(),
                             error = e.to_string()
                         );
-                        if let Some(key) = task_id_to_key.remove(&task_id) {
-                            shutdown_channels.retain(|(k, _)| k != &key);
-                            let outcome = if e.is_cancelled() {
-                                ExtensionOutcome::JoinCancelled
-                            } else {
-                                ExtensionOutcome::JoinPanic
-                            };
-                            monitor
-                                .apply_event(ExtensionLifecycleEvent::Completed { key, outcome });
+                        if e.is_cancelled() {
+                            ExtensionOutcome::JoinCancelled
+                        } else {
+                            ExtensionOutcome::JoinPanic
                         }
                     }
-                }
+                };
+                monitor.apply_event(ExtensionLifecycleEvent::Completed { key, outcome });
             }
         };
 
@@ -566,6 +535,7 @@ mod tests {
     };
     use crate::extension::wrapper::ExtensionVariant;
     use tokio::sync::oneshot;
+    use tokio::task;
 
     fn make_shutdown_channel(
         id: &'static str,
@@ -589,24 +559,17 @@ mod tests {
         rt.block_on(local_tasks.run_until(async {
             let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
             let key = ExtensionKey::new("stuck".into(), ExtensionVariant::Local);
-            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-                FuturesUnordered::new();
-            let handle = local_tasks.spawn_local({
-                let key = key.clone();
-                async move {
-                    std::future::pending::<()>().await;
-                    (key, Ok(()))
-                }
+            let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
+            let handle = local_tasks.spawn_local(async {
+                std::future::pending::<()>().await;
+                Ok(())
             });
-            let mut task_id_to_key = HashMap::new();
-            let _ = task_id_to_key.insert(handle.id(), key);
-            futures.push(handle);
+            futures.push(KeyedJoinHandle { key, handle });
 
             let injected_deadline = Instant::now() + Duration::from_millis(100);
             let (_started_tx, started_rx) = mpsc::unbounded_channel();
             let mut lifecycle = ExtensionLifecycle {
                 futures,
-                task_id_to_key,
                 shutdown_channels: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::ShuttingDown {
@@ -638,6 +601,92 @@ mod tests {
         }));
     }
 
+    /// Scenario: during the shutdown drain, one extension task panics and
+    /// another is aborted, so both join with an error and no task output.
+    /// Guarantees: `drain_until_deadline` attributes each join error to its own
+    /// extension: the monitor counts one panic and one cancellation under the
+    /// right keys, and both shutdown channels are pruned.
+    #[test]
+    fn drain_until_deadline_attributes_join_errors_to_their_extensions() {
+        let (rt, local_tasks) = crate::testing::setup_test_runtime();
+        rt.block_on(local_tasks.run_until(async {
+            let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
+            let mut monitor = ExtensionMetricsMonitor::new(
+                ext_ctx.clone(),
+                Duration::from_millis(50),
+                Duration::from_millis(50),
+            );
+            let (panic_key, panic_channel, _panic_rx) = make_shutdown_channel("panics");
+            let (cancel_key, cancel_channel, _cancel_rx) = make_shutdown_channel("cancelled");
+            for key in [&panic_key, &cancel_key] {
+                let entity_key =
+                    ext_ctx.register_extension_entity(key.id.clone(), ExtensionVariant::Local);
+                monitor.register(&ext_ctx, key.clone(), entity_key, None);
+            }
+
+            let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
+            let panic_handle = local_tasks.spawn_local(async {
+                task::yield_now().await;
+                panic!("simulated extension panic during drain");
+                #[allow(unreachable_code)]
+                Ok::<(), Error>(())
+            });
+            futures.push(KeyedJoinHandle {
+                key: panic_key.clone(),
+                handle: panic_handle,
+            });
+            let cancel_handle = local_tasks.spawn_local(async {
+                std::future::pending::<()>().await;
+                Ok::<(), Error>(())
+            });
+            cancel_handle.abort();
+            futures.push(KeyedJoinHandle {
+                key: cancel_key.clone(),
+                handle: cancel_handle,
+            });
+
+            let mut lifecycle = ExtensionLifecycle {
+                futures,
+                shutdown_channels: vec![
+                    (panic_key.clone(), panic_channel),
+                    (cancel_key.clone(), cancel_channel),
+                ],
+                _passive: Vec::new(),
+                phase: LifecyclePhase::ShuttingDown {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                },
+                monitor,
+                started_rx: mpsc::unbounded_channel().1,
+                pending_starts: HashSet::new(),
+                extension_readiness_probes: Vec::new(),
+            };
+
+            let prev_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            lifecycle.drain_until_deadline().await;
+            std::panic::set_hook(prev_hook);
+
+            assert!(lifecycle.futures.is_empty(), "both tasks must be drained");
+            assert!(
+                lifecycle.shutdown_channels.is_empty(),
+                "both shutdown channels must be pruned"
+            );
+            assert_eq!(lifecycle.monitor.completed_panic_count(&panic_key), Some(1));
+            assert_eq!(
+                lifecycle.monitor.completed_cancelled_count(&panic_key),
+                Some(0)
+            );
+            assert_eq!(
+                lifecycle.monitor.completed_cancelled_count(&cancel_key),
+                Some(1)
+            );
+            assert_eq!(
+                lifecycle.monitor.completed_panic_count(&cancel_key),
+                Some(0)
+            );
+        }));
+    }
+
     /// A panicking extension task must surface as a terminal `Failed`
     /// state and bump the `completed_panic` counter.
     #[test]
@@ -656,31 +705,21 @@ mod tests {
             );
             monitor.register(&ext_ctx, key.clone(), entity_key, None);
 
-            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-                FuturesUnordered::new();
-            let handle = local_tasks.spawn_local({
-                let task_key = key.clone();
-                async move {
-                    task::yield_now().await;
-                    panic!("simulated extension panic");
-                    #[allow(unreachable_code)]
-                    {
-                        let _: ExtensionKey = task_key;
-                        (
-                            ExtensionKey::new("never".into(), ExtensionVariant::Local),
-                            Ok(()),
-                        )
-                    }
-                }
+            let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
+            let handle = local_tasks.spawn_local(async {
+                task::yield_now().await;
+                panic!("simulated extension panic");
+                #[allow(unreachable_code)]
+                Ok::<(), Error>(())
             });
-            let mut task_id_to_key = HashMap::new();
-            let _ = task_id_to_key.insert(handle.id(), key.clone());
-            futures.push(handle);
+            futures.push(KeyedJoinHandle {
+                key: key.clone(),
+                handle,
+            });
 
             let (_started_tx, started_rx) = mpsc::unbounded_channel();
             let mut lifecycle = ExtensionLifecycle {
                 futures,
-                task_id_to_key,
                 shutdown_channels: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -735,7 +774,6 @@ mod tests {
 
             let mut lifecycle = ExtensionLifecycle {
                 futures: FuturesUnordered::new(),
-                task_id_to_key: HashMap::new(),
                 shutdown_channels: vec![(key_a, channel_a), (key_b, channel_b)],
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -870,7 +908,6 @@ mod tests {
 
             let mut life_a = ExtensionLifecycle {
                 futures: FuturesUnordered::new(),
-                task_id_to_key: HashMap::new(),
                 shutdown_channels: vec![(key_a, channel_a)],
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -881,7 +918,6 @@ mod tests {
             };
             let life_b = ExtensionLifecycle {
                 futures: FuturesUnordered::new(),
-                task_id_to_key: HashMap::new(),
                 shutdown_channels: vec![(key_b, channel_b)],
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -975,20 +1011,16 @@ mod tests {
             let (key_a, channel_a, _rx_a) = make_shutdown_channel("a");
             let (key_b, channel_b, _rx_b) = make_shutdown_channel("b");
 
-            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-                FuturesUnordered::new();
-            let handle = local_tasks.spawn_local({
-                let key = key_a.clone();
-                async move { (key, Ok(())) }
+            let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
+            let handle = local_tasks.spawn_local(async { Ok(()) });
+            futures.push(KeyedJoinHandle {
+                key: key_a.clone(),
+                handle,
             });
-            let mut task_id_to_key = HashMap::new();
-            let _ = task_id_to_key.insert(handle.id(), key_a.clone());
-            futures.push(handle);
 
             let (_started_tx, started_rx) = mpsc::unbounded_channel();
             let mut lifecycle = ExtensionLifecycle {
                 futures,
-                task_id_to_key,
                 shutdown_channels: vec![(key_a.clone(), channel_a), (key_b.clone(), channel_b)],
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -1036,20 +1068,16 @@ mod tests {
             let (key_a, channel_a, mut rx_a) = make_shutdown_channel("a");
             let (key_b, channel_b, mut rx_b) = make_shutdown_channel("b");
 
-            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-                FuturesUnordered::new();
-            let handle = local_tasks.spawn_local({
-                let key = key_a.clone();
-                async move { (key, Ok(())) }
+            let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
+            let handle = local_tasks.spawn_local(async { Ok(()) });
+            futures.push(KeyedJoinHandle {
+                key: key_a.clone(),
+                handle,
             });
-            let mut task_id_to_key = HashMap::new();
-            let _ = task_id_to_key.insert(handle.id(), key_a.clone());
-            futures.push(handle);
 
             let (_started_tx, started_rx) = mpsc::unbounded_channel();
             let mut lifecycle = ExtensionLifecycle {
                 futures,
-                task_id_to_key,
                 shutdown_channels: vec![(key_a.clone(), channel_a), (key_b.clone(), channel_b)],
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -1080,9 +1108,7 @@ mod tests {
             let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
 
             let (started_tx, started_rx) = mpsc::unbounded_channel::<ExtensionKey>();
-            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-                FuturesUnordered::new();
-            let mut task_id_to_key = HashMap::new();
+            let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
             let mut pending_starts: HashSet<ExtensionKey> = HashSet::new();
 
             for name in ["x", "y"] {
@@ -1090,19 +1116,20 @@ mod tests {
                 let started_tx = started_tx.clone();
                 let task_key = key.clone();
                 let handle = local_tasks.spawn_local(async move {
-                    let _ = started_tx.send(task_key.clone());
+                    let _ = started_tx.send(task_key);
                     std::future::pending::<()>().await;
-                    (task_key, Ok::<(), Error>(()))
+                    Ok::<(), Error>(())
                 });
-                let _ = task_id_to_key.insert(handle.id(), key.clone());
-                futures.push(handle);
+                futures.push(KeyedJoinHandle {
+                    key: key.clone(),
+                    handle,
+                });
                 let _ = pending_starts.insert(key);
             }
             drop(started_tx);
 
             let mut lifecycle = ExtensionLifecycle {
                 futures,
-                task_id_to_key,
                 shutdown_channels: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -1134,9 +1161,7 @@ mod tests {
             let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
 
             let (started_tx, started_rx) = mpsc::unbounded_channel::<ExtensionKey>();
-            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-                FuturesUnordered::new();
-            let mut task_id_to_key = HashMap::new();
+            let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
             let mut pending_starts: HashSet<ExtensionKey> = HashSet::new();
 
             // A: signals, then fails immediately.
@@ -1145,16 +1170,15 @@ mod tests {
                 let started_tx = started_tx.clone();
                 let task_key = a_key.clone();
                 let handle = local_tasks.spawn_local(async move {
-                    let _ = started_tx.send(task_key.clone());
-                    (
-                        task_key,
-                        Err::<(), Error>(Error::ExtensionExitedBeforeShutdown {
-                            extension: "a-fast-fail".into(),
-                        }),
-                    )
+                    let _ = started_tx.send(task_key);
+                    Err::<(), Error>(Error::ExtensionExitedBeforeShutdown {
+                        extension: "a-fast-fail".into(),
+                    })
                 });
-                let _ = task_id_to_key.insert(handle.id(), a_key.clone());
-                futures.push(handle);
+                futures.push(KeyedJoinHandle {
+                    key: a_key.clone(),
+                    handle,
+                });
                 let _ = pending_starts.insert(a_key);
             }
 
@@ -1164,12 +1188,14 @@ mod tests {
                 let started_tx = started_tx.clone();
                 let task_key = b_key.clone();
                 let handle = local_tasks.spawn_local(async move {
-                    let _ = started_tx.send(task_key.clone());
+                    let _ = started_tx.send(task_key);
                     std::future::pending::<()>().await;
-                    (task_key, Ok::<(), Error>(()))
+                    Ok::<(), Error>(())
                 });
-                let _ = task_id_to_key.insert(handle.id(), b_key.clone());
-                futures.push(handle);
+                futures.push(KeyedJoinHandle {
+                    key: b_key.clone(),
+                    handle,
+                });
                 let _ = pending_starts.insert(b_key);
             }
 
@@ -1177,7 +1203,6 @@ mod tests {
 
             let mut lifecycle = ExtensionLifecycle {
                 futures,
-                task_id_to_key,
                 shutdown_channels: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -1207,22 +1232,21 @@ mod tests {
             let (ext_ctx, _registry) = crate::testing::test_extension_ctx();
 
             let (_started_tx, started_rx) = mpsc::unbounded_channel::<ExtensionKey>();
-            let futures: FuturesUnordered<JoinHandle<(ExtensionKey, Result<(), Error>)>> =
-                FuturesUnordered::new();
-            let mut task_id_to_key = HashMap::new();
+            let futures: FuturesUnordered<KeyedJoinHandle> = FuturesUnordered::new();
 
             let key = ExtensionKey::local("paniker");
             let handle = local_tasks.spawn_local(async {
                 panic!("synthetic first-poll panic");
                 #[allow(unreachable_code)]
-                (ExtensionKey::local("paniker"), Ok::<(), Error>(()))
+                Ok::<(), Error>(())
             });
-            let _ = task_id_to_key.insert(handle.id(), key.clone());
-            futures.push(handle);
+            futures.push(KeyedJoinHandle {
+                key: key.clone(),
+                handle,
+            });
 
             let mut lifecycle = ExtensionLifecycle {
                 futures,
-                task_id_to_key,
                 shutdown_channels: Vec::new(),
                 _passive: Vec::new(),
                 phase: LifecyclePhase::Running,
@@ -1444,7 +1468,6 @@ mod tests {
         let (_started_tx, started_rx) = mpsc::unbounded_channel::<ExtensionKey>();
         ExtensionLifecycle {
             futures: FuturesUnordered::new(),
-            task_id_to_key: HashMap::new(),
             shutdown_channels: Vec::new(),
             _passive: Vec::new(),
             phase: LifecyclePhase::Running,
@@ -1685,14 +1708,14 @@ mod tests {
             ));
 
             let dead_key = ExtensionKey::new("dead-ext".into(), ExtensionVariant::Shared);
-            lifecycle.futures.push(task::spawn_local(async move {
-                (
-                    dead_key,
+            lifecycle.futures.push(KeyedJoinHandle {
+                key: dead_key,
+                handle: task::spawn_local(async {
                     Err(Error::InternalError {
                         message: "extension died during startup".into(),
-                    }),
-                )
-            }));
+                    })
+                }),
+            });
 
             let outcome =
                 tokio::time::timeout(Duration::from_secs(1), lifecycle.wait_all_ready()).await;

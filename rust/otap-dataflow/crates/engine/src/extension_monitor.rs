@@ -376,7 +376,6 @@ impl ExtensionMetricsMonitor {
 
     /// Returns the `completed_cancelled` counter for `key`, or `None` if absent.
     #[cfg(test)]
-    #[allow(dead_code)] // kept for symmetry with completed_panic_count
     pub(crate) fn completed_cancelled_count(&self, key: &ExtensionKey) -> Option<u64> {
         self.entries
             .iter()
